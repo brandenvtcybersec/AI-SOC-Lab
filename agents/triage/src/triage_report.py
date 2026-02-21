@@ -139,6 +139,8 @@ def build_executive_summary(chains: list[dict], evidence_by_host: dict, window_m
     lines.append("")
     lines.append("**Severity:** CRITICAL (correlated multi-signal behavior)")
     lines.append("")
+    lines.append("**Confidence:** Medium (rule-based correlation; validate payload + destination legitimacy)")
+    lines.append("")
 
     # Keep it readable; summarize up to 3 hosts
     for ch in chains[:3]:
