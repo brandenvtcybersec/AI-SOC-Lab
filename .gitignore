@@ -9,3 +9,8 @@ agents/collector/.env
 __pycache__/
 *.pyc
 agents/triage/output/
+agents/collector/cases/
+agents/triage/output/
+.venv/
+__pycache__/
+*.pyc
