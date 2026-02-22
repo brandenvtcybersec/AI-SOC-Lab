@@ -14,3 +14,4 @@ agents/triage/output/
 .venv/
 __pycache__/
 *.pyc
+agents/remediate/logs/

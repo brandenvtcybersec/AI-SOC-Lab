@@ -255,6 +255,14 @@ agents/triage/output/report\_<timestamp>.md
 agents/triage/output/triage\_<timestamp>.json
 
 
+## Remediation Agent (Close-the-loop)
+
+Recommend (no changes):
+python agents/remediate/src/remediate.py --mode recommend
+
+Execute (requires Admin):
+python agents/remediate/src/remediate.py --mode execute --fw-minutes 30
+
 
 #### **Version Milestones**
 
