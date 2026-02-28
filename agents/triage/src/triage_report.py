@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
 import re
+import base64
 
 
 def utc_now_iso() -> str:
@@ -34,7 +35,6 @@ WEIGHTS = {
     "smoke_test": 0,
 }
 
-# SOC-ish correlation window (minutes)
 CORRELATION_WINDOW_MINUTES = 10
 
 
@@ -129,20 +129,125 @@ def pick_best_str(value, default="-"):
     return s if s else default
 
 
+# ---------------------------
+# EncodedCommand analysis
+# ---------------------------
+
+ENC_RE = re.compile(r"(?i)(?:-enc(?:odedcommand)?\s+)([A-Za-z0-9+/=]+)")
+
+SUSPICIOUS_MARKERS = [
+    ("invoke_expression", re.compile(r"(?i)\bInvoke-Expression\b|\bIEX\b")),
+    ("downloadstring", re.compile(r"(?i)DownloadString\b")),
+    ("webclient", re.compile(r"(?i)Net\.WebClient|New-Object\s+Net\.WebClient")),
+    ("invoke_webrequest", re.compile(r"(?i)\bInvoke-WebRequest\b|\biwr\b")),
+    ("invoke_restmethod", re.compile(r"(?i)\bInvoke-RestMethod\b|\birm\b")),
+    ("frombase64", re.compile(r"(?i)FromBase64String")),
+    ("add_type", re.compile(r"(?i)\bAdd-Type\b")),
+    ("start_process", re.compile(r"(?i)\bStart-Process\b")),
+    ("bitsadmin", re.compile(r"(?i)\bbitsadmin\b")),
+    ("certutil", re.compile(r"(?i)\bcertutil\b")),
+    ("rundll32", re.compile(r"(?i)\brundll32\b")),
+    ("reg_add", re.compile(r"(?i)\breg\s+add\b")),
+    ("schtasks", re.compile(r"(?i)\bschtasks\b")),
+    ("powershell_hidden", re.compile(r"(?i)-w\s+hidden|-windowstyle\s+hidden")),
+    ("url", re.compile(r"(?i)\bhttps?://[^\s'\"`]+")),
+]
+
+# Simple score bumps for decoded payload markers
+MARKER_SCORE = {
+    "invoke_expression": 25,
+    "downloadstring": 25,
+    "webclient": 20,
+    "invoke_webrequest": 15,
+    "invoke_restmethod": 15,
+    "url": 10,
+    "frombase64": 10,
+    "add_type": 10,
+    "start_process": 10,
+    "reg_add": 10,
+    "schtasks": 10,
+    "bitsadmin": 10,
+    "certutil": 10,
+    "rundll32": 10,
+    "powershell_hidden": 10,
+}
+
+
+def decode_powershell_encodedcommand(commandline: str) -> dict:
+    """
+    Extract and decode -EncodedCommand payload (typically UTF-16LE).
+    Defensive analysis only: does NOT execute anything.
+    """
+    cl = commandline or ""
+    m = ENC_RE.search(cl)
+    if not m:
+        return {"found": False}
+
+    b64 = m.group(1)
+    # Normalize padding
+    pad = len(b64) % 4
+    if pad:
+        b64 = b64 + ("=" * (4 - pad))
+
+    raw = None
+    decoded_text = None
+    errors = []
+
+    try:
+        raw = base64.b64decode(b64, validate=False)
+    except Exception as e:
+        errors.append(f"base64_decode_error: {e}")
+        return {"found": True, "b64": m.group(1), "decoded": None, "markers": [], "score_bump": 0, "errors": errors}
+
+    # PowerShell typically uses UTF-16LE for -EncodedCommand
+    for enc in ("utf-16le", "utf-8", "latin-1"):
+        try:
+            decoded_text = raw.decode(enc, errors="strict")
+            break
+        except Exception as e:
+            errors.append(f"decode_{enc}_error: {e}")
+
+    if decoded_text is None:
+        # last resort
+        decoded_text = raw.decode("utf-8", errors="replace")
+        errors.append("decoded_with_utf8_replace")
+
+    markers = []
+    score_bump = 0
+    for name, rx in SUSPICIOUS_MARKERS:
+        if rx.search(decoded_text):
+            markers.append(name)
+            score_bump += MARKER_SCORE.get(name, 0)
+
+    # cap bump so it doesn't blow out scoring
+    score_bump = min(score_bump, 60)
+
+    return {
+        "found": True,
+        "b64": m.group(1),
+        "decoded": decoded_text,
+        "markers": sorted(list(set(markers))),
+        "score_bump": score_bump,
+        "errors": errors,
+    }
+
+
+def confidence_from_score(score: int) -> str:
+    if score >= 90:
+        return "High"
+    if score >= 70:
+        return "Medium"
+    return "Low"
+
+
 def build_executive_summary(chains: list[dict], evidence_by_host: dict, window_min: int) -> list[str]:
-    """
-    Builds a SOC-style narrative section when correlation is present.
-    Pulls key evidence (encoded command, destination IP/port) if available.
-    """
     lines = []
     lines.append("## SOC Escalation Note")
     lines.append("")
     lines.append("**Severity:** CRITICAL (correlated multi-signal behavior)")
-    lines.append("")
     lines.append("**Confidence:** Medium (rule-based correlation; validate payload + destination legitimacy)")
     lines.append("")
 
-    # Keep it readable; summarize up to 3 hosts
     for ch in chains[:3]:
         host = ch["host"]
         chain_desc = ch["chain"]
@@ -162,12 +267,10 @@ def build_executive_summary(chains: list[dict], evidence_by_host: dict, window_m
         lines.append("- **Key evidence:**")
         lines.append(f"  - Encoded PowerShell: `{img}` (parent `{parent}`)")
         if enc_cmd != "-":
-            # Avoid dumping super long commands
             preview = enc_cmd if len(enc_cmd) <= 220 else enc_cmd[:220] + "…"
             lines.append(f"  - CommandLine: `{preview}`")
         lines.append(f"  - Outbound connection: `{proto}` to `{dip}:{dport}`")
         lines.append("")
-
     lines.append("**Immediate actions (recommended):**")
     lines.append("1. Decode and review any `-EncodedCommand` payload; determine intent (benign admin vs malicious).")
     lines.append("2. Pivot on process tree (parent → child) and search for follow-on activity (file writes, persistence, additional network connections).")
@@ -193,8 +296,11 @@ def main():
     data = json.loads(cases_path.read_text(encoding="utf-8"))
 
     triage_cases = []
-    by_host = defaultdict(dict)          # host -> det -> {count, first_seen}
-    evidence_by_host = defaultdict(dict) # host -> key evidence for narrative
+    by_host = defaultdict(dict)
+    evidence_by_host = defaultdict(dict)
+
+    # store extra decode analysis per detection for reporting
+    decode_findings = {}
 
     for case in data.get("cases", []):
         det = case.get("detection", "unknown")
@@ -208,16 +314,52 @@ def main():
         base_score = 0 if count == 0 else WEIGHTS.get(det, 10)
         severity = "info" if det == "smoke_test" else score_to_severity(base_score)
 
+        # EncodedCommand decode enrichment (only for sysmon_encoded_powershell)
+        score_bump = 0
+        decoded_summary = None
+        decoded_snippet = None
+        markers = []
+        decode_errors = []
+
+        if det == "sysmon_encoded_powershell" and count > 0 and events:
+            # use the first event's commandline
+            cmdline = pick_best_str(events[0].get("CommandLine"), "")
+            dec = decode_powershell_encodedcommand(cmdline)
+            if dec.get("found"):
+                markers = dec.get("markers", [])
+                score_bump = int(dec.get("score_bump", 0) or 0)
+                decode_errors = dec.get("errors", []) or []
+                decoded_text = dec.get("decoded")
+                if decoded_text:
+                    # Keep snippet short for report safety/readability
+                    decoded_snippet = decoded_text.strip().replace("\r\n", "\n")
+                    if len(decoded_snippet) > 800:
+                        decoded_snippet = decoded_snippet[:800] + "\n…(truncated)…"
+                decoded_summary = f"Decoded EncodedCommand markers: {', '.join(markers) if markers else 'none'} (score bump +{score_bump})."
+                decode_findings[det] = {
+                    "markers": markers,
+                    "score_bump": score_bump,
+                    "decode_errors": decode_errors,
+                    "decoded_snippet": decoded_snippet,
+                }
+
+        final_score = base_score + score_bump
+        if det == "smoke_test":
+            final_score = 0
+        final_score = min(final_score, 100)
+
         triage_cases.append({
             "detection": det,
             "event_count": count,
             "hosts": sorted(list(hosts)) if hosts else [],
             "first_seen_utc": first_seen.isoformat().replace("+00:00", "Z") if first_seen else None,
             "mitre": MITRE_BY_DETECTION.get(det, []),
-            "score": base_score,
-            "severity": severity,
-            "summary": f"{det} returned {count} event(s).",
+            "score": final_score,
+            "severity": "info" if det == "smoke_test" else score_to_severity(final_score),
+            "confidence": "None" if det == "smoke_test" else confidence_from_score(final_score),
+            "summary": decoded_summary if decoded_summary else f"{det} returned {count} event(s).",
             "sample_events": events[:2],
+            "decode_findings": decode_findings.get(det),
         })
 
         if count > 0:
@@ -226,8 +368,7 @@ def main():
             for h in hosts:
                 by_host[h][det] = {"count": count, "first_seen": first_seen}
 
-        # Collect narrative evidence (best-effort) from sample events
-        # Encoded PowerShell detection sample event
+        # Evidence collection for executive narrative
         if det == "sysmon_encoded_powershell" and events:
             e = events[0]
             h = pick_best_str(e.get("host"), "(unknown-host)")
@@ -235,7 +376,6 @@ def main():
             evidence_by_host[h]["encoded_parent"] = pick_best_str(e.get("ParentImage"))
             evidence_by_host[h]["encoded_image"] = pick_best_str(e.get("Image"))
 
-        # Scripting network detection sample event
         if det == "sysmon_scripting_network" and events:
             e = events[0]
             h = pick_best_str(e.get("host"), "(unknown-host)")
@@ -243,7 +383,7 @@ def main():
             evidence_by_host[h]["dest_port"] = pick_best_str(e.get("DestinationPort"))
             evidence_by_host[h]["dest_proto"] = pick_best_str(e.get("Protocol"))
 
-    # Correlation
+    # Correlation logic
     chains = []
     escalate_pairs = defaultdict(set)
     window_min = CORRELATION_WINDOW_MINUTES
@@ -252,7 +392,6 @@ def main():
         def t(det_name: str) -> datetime | None:
             return dets.get(det_name, {}).get("first_seen")
 
-        # Chain A: Encoded PS + scripting network within window
         if "sysmon_encoded_powershell" in dets and "sysmon_scripting_network" in dets:
             if within_window(t("sysmon_encoded_powershell"), t("sysmon_scripting_network"), window_min):
                 chains.append({
@@ -263,7 +402,6 @@ def main():
                 escalate_pairs["sysmon_encoded_powershell"].add(host)
                 escalate_pairs["sysmon_scripting_network"].add(host)
 
-        # Chain B: bruteforce+success + service creation within window
         if "bruteforce_then_success" in dets and "new_service_created" in dets:
             if within_window(t("bruteforce_then_success"), t("new_service_created"), window_min):
                 chains.append({
@@ -274,7 +412,6 @@ def main():
                 escalate_pairs["bruteforce_then_success"].add(host)
                 escalate_pairs["new_service_created"].add(host)
 
-        # Chain C: Office->PowerShell + LOLBins within window
         if "sysmon_office_to_powershell" in dets and "sysmon_lolbins_suspicious" in dets:
             if within_window(t("sysmon_office_to_powershell"), t("sysmon_lolbins_suspicious"), window_min):
                 chains.append({
@@ -285,7 +422,7 @@ def main():
                 escalate_pairs["sysmon_office_to_powershell"].add(host)
                 escalate_pairs["sysmon_lolbins_suspicious"].add(host)
 
-    # Escalate ONLY involved detections on involved hosts; smoke_test never escalates
+    # Escalate only involved detections on involved hosts
     for c in triage_cases:
         det = c["detection"]
         if det == "smoke_test" or c["event_count"] == 0:
@@ -294,12 +431,11 @@ def main():
         if det in escalate_pairs and (hosts & escalate_pairs[det]):
             c["severity"] = "critical"
             c["score"] = max(c["score"], 90)
+            c["confidence"] = "High"
 
-    # Sort report by severity
     sev_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
     triage_sorted = sorted(triage_cases, key=lambda x: sev_rank.get(x["severity"], 0), reverse=True)
 
-    # Write report
     report_lines = []
     report_lines.append("# AI SOC Incident Report")
     report_lines.append("")
@@ -311,7 +447,6 @@ def main():
 
     if chains:
         report_lines.extend(build_executive_summary(chains, evidence_by_host, window_min))
-
         report_lines.append("##  Correlated Attack Chains")
         report_lines.append("")
         for ch in chains:
@@ -332,8 +467,22 @@ def main():
             report_lines.append(f"- **First seen (UTC):** {c['first_seen_utc']}")
         if c["mitre"]:
             report_lines.append(f"- **MITRE:** {', '.join(c['mitre'])}")
+        report_lines.append(f"- **Confidence:** {c.get('confidence','-')}")
         report_lines.append(f"- **Summary:** {c['summary']}")
         report_lines.append("")
+
+        # Add decoded payload snippet if present
+        if c.get("decode_findings") and c["decode_findings"].get("decoded_snippet"):
+            df = c["decode_findings"]
+            report_lines.append("**Decoded EncodedCommand (truncated)**")
+            report_lines.append("```text")
+            report_lines.append(df["decoded_snippet"])
+            report_lines.append("```")
+            if df.get("markers"):
+                report_lines.append(f"**Decoded markers:** {', '.join(df['markers'])}")
+            if df.get("decode_errors"):
+                report_lines.append(f"**Decode notes:** {', '.join(df['decode_errors'])}")
+            report_lines.append("")
 
         if c["sample_events"]:
             report_lines.append("**Sample evidence (first 2 events)**")
